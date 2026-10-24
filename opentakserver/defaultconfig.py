@@ -45,6 +45,11 @@ class DefaultConfig:
     OTS_TCP_STREAMING_PORT = int(os.getenv("OTS_TCP_STREAMING_PORT", 8088))
     OTS_SSL_STREAMING_PORT = int(os.getenv("OTS_SSL_STREAMING_PORT", 8089))
     OTS_STREAMING_INTERFACE = os.getenv("OTS_STREAMING_INTERFACE", "0.0.0.0")
+    # Close a TCP/SSL streaming connection after this many seconds without hearing from the EUD.
+    # ATAK pings (t-x-c-t) once the server has been quiet for 15 seconds, but while the server
+    # keeps sending to it the only guaranteed traffic is its position report, which defaults to
+    # every 180 seconds when stationary. Set to 0 to disable.
+    OTS_EUD_IDLE_TIMEOUT = int(os.getenv("OTS_EUD_IDLE_TIMEOUT", 300))
     OTS_BACKUP_COUNT = int(os.getenv("OTS_BACKUP_COUNT", 7))
     OTS_ENABLE_CHANNELS = os.getenv("OTS_ENABLE_CHANNELS", "True").lower() in ["true", "1", "yes"]
 

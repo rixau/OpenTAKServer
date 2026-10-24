@@ -6,13 +6,15 @@ import os
 import platform
 import random
 import re
+import socket as socket_module
 import socketserver
 import sys
+import time
 import traceback
 import uuid
 from logging.handlers import TimedRotatingFileHandler
-from socket import socket, SHUT_RDWR
-from threading import Thread
+from socket import socket, SHUT_RDWR, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP
+from threading import Thread, current_thread
 from xml.etree.ElementTree import Element, SubElement, tostring, fromstring, ParseError
 
 import bleach
@@ -87,6 +89,12 @@ class EudHandler(socketserver.BaseRequestHandler):
     bound_queues = []
     phone_number = None
     group_memberships = []
+    idle_timeout = None
+    closed = False
+    # Set when a newer connection for the same uid takes over this one
+    replaced = False
+    session_id = None
+    connected_at = None
 
     def __init__(self, request: socket, client_address, server):
         super().__init__(request, client_address, server)
@@ -99,6 +107,11 @@ class EudHandler(socketserver.BaseRequestHandler):
         while not self.shutdown:
             try:
                 data = self.request.recv(65536)
+            except TimeoutError:
+                self.logger.info(
+                    f"Nothing received from {self.callsign or self.client_address[0]} in {self.idle_timeout} seconds, closing"
+                )
+                break
             except Exception as e:
                 self.logger.debug(f"recv failed: {e}")
                 break
@@ -160,6 +173,10 @@ class EudHandler(socketserver.BaseRequestHandler):
 
     def setup(self):
         self.create_app()
+        self.session_id = uuid.uuid4().hex
+        self.connected_at = time.time()
+        self.idle_timeout = self.app.config.get("OTS_EUD_IDLE_TIMEOUT") or None
+        self.configure_socket()
 
         # RabbitMQ
         try:
@@ -185,40 +202,83 @@ class EudHandler(socketserver.BaseRequestHandler):
             self.logger.error("Failed to connect to rabbitmq: {}".format(e))
             return
 
+    def configure_socket(self):
+        # The UDP server hands handlers a (data, socket) tuple
+        if not isinstance(self.request, socket):
+            return
+
+        # recv() raises TimeoutError after this long without data, handle() treats that as dead
+        self.request.settimeout(self.idle_timeout)
+
+        # Let the kernel notice peers that vanished without a FIN or RST
+        self.request.setsockopt(SOL_SOCKET, SO_KEEPALIVE, 1)
+        for option, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 6)):
+            if hasattr(socket_module, option):
+                self.request.setsockopt(IPPROTO_TCP, getattr(socket_module, option), value)
+
     def finish(self):
-        print("finish")
+        # This process exits as soon as finish() returns, so give the ioloop a moment to close
+        # the RabbitMQ connection cleanly. Closing it is what cancels this connection's consumers.
+        if self.iothread and self.iothread.is_alive() and self.iothread is not current_thread():
+            self.iothread.join(timeout=5)
 
     def close_connection(self):
-        self.logger.info("{} disconnected".format(self.client_address[0]))
+        # Called from the socket thread, the ioloop thread, or both
+        if self.closed:
+            return
+        self.closed = True
+        self.shutdown = True
 
-        self.rabbit_channel.basic_publish(
-            exchange="cot_parser",
-            body=json.dumps(
-                {
-                    "uid": self.uid,
-                    "cot": None,
-                    "disconnected": True,
-                    "user_id": self.user.id if self.user else None,
-                }
-            ),
-            routing_key="cot_parser",
-            properties=pika.BasicProperties(expiration=self.app.config.get("OTS_RABBITMQ_TTL")),
-        )
+        self.logger.info("{} disconnected".format(self.callsign or self.client_address[0]))
 
-        self.unbind_rabbitmq_queues()
-
+        # pika isn't thread safe, so RabbitMQ is closed from the ioloop thread
         if (
-            self.rabbit_channel
-            and not self.rabbit_channel.is_closing
-            and not self.rabbit_channel.is_closed
+            self.rabbit_connection
+            and not self.rabbit_connection.is_closing
+            and not self.rabbit_connection.is_closed
         ):
-            self.rabbit_channel.close()
+            self.rabbit_connection.ioloop.add_callback_threadsafe(self.close_rabbitmq)
 
-        if not self.shutdown:
-            self.shutdown = True
-
+        # Wakes handle() if it's blocked in recv(). socketserver closes the socket after finish()
+        try:
             self.request.shutdown(SHUT_RDWR)
-            self.request.close()
+        except OSError:
+            pass
+
+    def close_rabbitmq(self):
+        try:
+            if self.rabbit_channel and self.rabbit_channel.is_open:
+                # A newer connection for this uid owns the queues now, so leave them bound
+                # and don't tell cot_parser that the EUD disconnected
+                if not self.replaced:
+                    self.rabbit_channel.basic_publish(
+                        exchange="cot_parser",
+                        body=json.dumps(
+                            {
+                                "uid": self.uid,
+                                "cot": None,
+                                "disconnected": True,
+                                "user_id": self.user.id if self.user else None,
+                            }
+                        ),
+                        routing_key="cot_parser",
+                        properties=pika.BasicProperties(
+                            expiration=self.app.config.get("OTS_RABBITMQ_TTL")
+                        ),
+                    )
+                    self.unbind_rabbitmq_queues()
+
+                # on_channel_close closes the connection, which stops the ioloop
+                self.rabbit_channel.close()
+            elif (
+                self.rabbit_connection
+                and not self.rabbit_connection.is_closing
+                and not self.rabbit_connection.is_closed
+            ):
+                self.rabbit_connection.close()
+        except BaseException as e:
+            self.logger.error(f"Failed to close RabbitMQ for {self.callsign}: {e}")
+            self.logger.debug(traceback.format_exc())
 
     def create_app(self):
         app = Flask(__name__)
@@ -283,6 +343,8 @@ class EudHandler(socketserver.BaseRequestHandler):
         self.rabbit_channel.exchange_declare(
             "flask-socketio", durable=False, exchange_type="fanout"
         )
+        # Used to tell an older connection for a uid that the EUD has reconnected
+        self.rabbit_channel.exchange_declare("eud_sessions", durable=True, exchange_type="direct")
 
         for message in self.cached_messages:
             self.publish_cot(message)
@@ -310,7 +372,11 @@ class EudHandler(socketserver.BaseRequestHandler):
             )
 
     def on_channel_close(self, channel: Channel, error):
-        self.logger.error(f"RabbitMQ channel closed for {self.callsign}, shut it down")
+        if self.closed:
+            self.logger.debug(f"RabbitMQ channel closed for {self.callsign}")
+        else:
+            self.logger.error(f"RabbitMQ channel closed for {self.callsign}: {error}, shut it down")
+
         if (
             self.rabbit_connection
             and not self.rabbit_connection.is_closing
@@ -318,9 +384,8 @@ class EudHandler(socketserver.BaseRequestHandler):
         ):
             self.rabbit_connection.close()
 
-        self.shutdown = True
-        # self.request.shutdown(socket.SHUT_RDWR)
-        # self.sock.close()
+        # Without a channel nothing reaches this EUD, so disconnect it and let it reconnect
+        self.close_connection()
 
     def on_close(self, connection, error):
         # Stop the ioloop using add_callback_threadsafe because ioloop.stop() isn't threadsafe
@@ -336,6 +401,52 @@ class EudHandler(socketserver.BaseRequestHandler):
             self.logger.error(f"{self.callsign}: {e}, closing socket")
             self.close_connection()
             self.logger.error(traceback.format_exc())
+
+    def claim_uid(self):
+        """Tell any other handler serving this uid to close. Runs on the ioloop thread."""
+        if not self.rabbit_channel or not self.rabbit_channel.is_open:
+            return
+
+        queue = f"eud_session.{self.session_id}"
+        self.rabbit_channel.queue_declare(queue=queue, exclusive=True, auto_delete=True)
+        self.rabbit_channel.queue_bind(exchange="eud_sessions", queue=queue, routing_key=self.uid)
+        self.rabbit_channel.basic_consume(
+            queue=queue, on_message_callback=self.on_session_message, auto_ack=True
+        )
+        self.rabbit_channel.basic_publish(
+            exchange="eud_sessions",
+            routing_key=self.uid,
+            body=json.dumps(
+                {
+                    "uid": self.uid,
+                    "session_id": self.session_id,
+                    "connected_at": self.connected_at,
+                }
+            ),
+        )
+
+    def on_session_message(self, unused_channel, basic_deliver, properties, body):
+        # Another handler, probably in another process, has identified the same uid.
+        # The newest connection wins: an EUD that reconnects has given up on its old socket,
+        # even if this side never saw it close, and two consumers on one queue split its messages.
+        try:
+            body = json.loads(body)
+            if body.get("uid") != self.uid or body.get("session_id") == self.session_id:
+                return
+            if (body.get("connected_at", 0), body.get("session_id")) < (
+                self.connected_at,
+                self.session_id,
+            ):
+                return
+
+            self.logger.info(
+                f"{self.callsign} ({self.uid}) connected again from another socket, closing this one"
+            )
+            self.replaced = True
+            self.close_connection()
+        except BaseException as e:
+            self.logger.error(f"Failed to handle session message: {e}")
+            self.logger.debug(traceback.format_exc())
 
     def handle_auth(self, auth: str):
         self.logger.debug(auth)
@@ -643,6 +754,7 @@ class EudHandler(socketserver.BaseRequestHandler):
                         self.rabbit_channel.basic_consume(
                             queue=self.uid, on_message_callback=self.on_message, auto_ack=True
                         )
+                        self.rabbit_connection.ioloop.add_callback_threadsafe(self.claim_uid)
 
             if "phone" in contact.attrs and contact.attrs["phone"]:
                 self.phone_number = contact.attrs["phone"]
