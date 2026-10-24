@@ -1,0 +1,80 @@
+# Local OpenTAKServer stack for reproducing stale EUD sessions.
+# Run through ./run.sh, which sets the project name and OTS_CODE.
+# Nothing is published to the host: the fake clients run on the same network.
+name: ots-stale-eud
+
+x-ots: &ots
+  image: ots-stale-eud:1.7.14
+  environment:
+    OTS_DATA_FOLDER: /app/ots
+    SQLALCHEMY_DATABASE_URI: postgresql+psycopg://ots:ots@postgres/ots
+    OTS_RABBITMQ_SERVER_ADDRESS: rabbitmq
+    OTS_LISTENER_ADDRESS: 0.0.0.0
+    OTS_MEDIAMTX_ENABLE: "False"
+    OTS_EUD_IDLE_TIMEOUT: ${OTS_EUD_IDLE_TIMEOUT:-300}
+  volumes:
+    - ots-data:/app/ots
+    - ${OTS_CODE:?set OTS_CODE to an OpenTAKServer checkout}:/code:ro
+  networks: [ots]
+
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: ots
+      POSTGRES_PASSWORD: ots
+      POSTGRES_DB: ots
+    networks: [ots]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ots"]
+      interval: 2s
+      retries: 30
+
+  rabbitmq:
+    image: rabbitmq:3.13
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/90-repro.conf:ro
+    networks: [ots]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 3s
+      retries: 40
+
+  ots:
+    <<: *ots
+    command: ["opentakserver"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      rabbitmq: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8081/api/health"]
+      interval: 3s
+      retries: 100
+
+  cot-parser:
+    <<: *ots
+    command: ["cot_parser"]
+    depends_on:
+      ots: { condition: service_healthy }
+
+  eud-handler-ssl:
+    <<: *ots
+    command: ["eud_handler", "--ssl"]
+    depends_on:
+      ots: { condition: service_healthy }
+
+  client:
+    image: python:3.13-slim
+    profiles: [client]
+    working_dir: /repro
+    entrypoint: ["python", "-u", "/repro/fake_client.py"]
+    volumes:
+      - ./:/repro:ro
+      - ./.work/certs:/certs:ro
+    networks: [ots]
+
+volumes:
+  ots-data:
+
+networks:
+  ots:
